@@ -1,20 +1,15 @@
 """
 Billboard mockup compositing microservice.
-
 Takes a base billboard photo (by URL), a design image (uploaded), and 4 corner
 points, and returns the design perspective-warped onto the billboard photo.
-
 Run locally:
     pip install fastapi uvicorn opencv-python-headless numpy python-multipart requests
     uvicorn main:app --host 0.0.0.0 --port 8000
-
 Deploy: push this folder to Railway/Render as a Python web service.
 Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
-
 import io
 import json
-
 import cv2
 import numpy as np
 import requests
@@ -44,7 +39,7 @@ async def composite(
     design: UploadFile = File(...),
 ):
     base = load_image_from_url(base_photo_url)
-        design_bytes = await design.read()
+    design_bytes = await design.read()
     design_img = load_image_from_bytes(design_bytes, keep_alpha=True)
 
     if design_img.shape[2] == 4:
@@ -67,6 +62,7 @@ async def composite(
     H, _ = cv2.findHomography(src_pts, dst_pts)
     warped = cv2.warpPerspective(design_bgr, H, (w_base, h_base))
     warped_alpha = cv2.warpPerspective(design_alpha, H, (w_base, h_base))
+
     mask = warped_alpha
     mask_inv = cv2.bitwise_not(mask)
     base_bg = cv2.bitwise_and(base, base, mask=mask_inv)
@@ -76,7 +72,6 @@ async def composite(
     ok, buf = cv2.imencode(".png", result)
     if not ok:
         return {"error": "failed to encode result image"}
-
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
 
 
