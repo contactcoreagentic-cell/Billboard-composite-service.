@@ -85,7 +85,72 @@ def parse_faces(faces: str | None, corners: str | None) -> list[np.ndarray]:
 
 # ---------- compositing ----------
 
-def composite_faces(base: np.ndarray, design: np.ndarray, faces: list[np.ndarray]) -> np.ndarray:
+FIT_ALIASES = {
+    "stretch": "stretch", "": "stretch",
+    "cover": "cover", "crop": "cover", "crop to fill": "cover", "fill": "cover",
+    "contain": "contain", "fit": "contain", "fit inside": "contain",
+}
+
+
+def normalise_fit(fit: str | None) -> str:
+    key = (fit or "").strip().lower()
+    if key not in FIT_ALIASES:
+        raise ValueError(f"unknown fit '{fit}' (use stretch, cover or contain)")
+    return FIT_ALIASES[key]
+
+
+def face_aspect(quad: np.ndarray) -> float:
+    """Approximate width/height of the real board from its 4 corners (TL, TR, BR, BL)."""
+    tl, tr, br, bl = quad
+    width = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
+    height = (np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2
+    return float(width / max(height, 1e-6))
+
+
+def parse_colour(hex_colour: str | None, design_bgr: np.ndarray) -> np.ndarray:
+    """'#RRGGBB' -> BGR. Without one, use the design's typical edge colour."""
+    if hex_colour:
+        h = hex_colour.strip().lstrip("#")
+        if len(h) != 6:
+            raise ValueError("background must look like #RRGGBB")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        return np.array([b, g, r], dtype=np.uint8)
+    edges = np.concatenate([design_bgr[0], design_bgr[-1], design_bgr[:, 0], design_bgr[:, -1]])
+    return np.median(edges, axis=0).astype(np.uint8)
+
+
+def fit_design(bgr: np.ndarray, alpha: np.ndarray, target_aspect: float,
+               fit: str, bg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reshape the design to the board's proportions so it isn't distorted."""
+    if fit == "stretch":
+        return bgr, alpha
+    h, w = bgr.shape[:2]
+    aspect = w / h
+    if fit == "cover":  # trim the edges, keep the centre
+        if aspect > target_aspect:
+            new_w = max(1, round(h * target_aspect))
+            x0 = (w - new_w) // 2
+            return bgr[:, x0:x0 + new_w], alpha[:, x0:x0 + new_w]
+        new_h = max(1, round(w / target_aspect))
+        y0 = (h - new_h) // 2
+        return bgr[y0:y0 + new_h], alpha[y0:y0 + new_h]
+    # contain: pad with a plain background, design centred and whole
+    if aspect > target_aspect:
+        canvas_w, canvas_h = w, max(h, round(w / target_aspect))
+    else:
+        canvas_w, canvas_h = max(w, round(h * target_aspect)), h
+    canvas = np.empty((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas[:] = bg
+    canvas_alpha = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+    x0, y0 = (canvas_w - w) // 2, (canvas_h - h) // 2
+    a = (alpha.astype(np.float32) / 255.0)[:, :, None]
+    region = canvas[y0:y0 + h, x0:x0 + w].astype(np.float32)
+    canvas[y0:y0 + h, x0:x0 + w] = (bgr * a + region * (1 - a)).astype(np.uint8)
+    return canvas, canvas_alpha
+
+
+def composite_faces(base: np.ndarray, design: np.ndarray, faces: list[np.ndarray],
+                    fit: str = "stretch", background: str | None = None) -> np.ndarray:
     if design.shape[2] == 4:
         design_bgr = design[:, :, :3]
         design_alpha = design[:, :, 3]
@@ -93,15 +158,18 @@ def composite_faces(base: np.ndarray, design: np.ndarray, faces: list[np.ndarray
         design_bgr = design
         design_alpha = np.full(design.shape[:2], 255, dtype=np.uint8)
 
+    fit = normalise_fit(fit)
+    bg = parse_colour(background, design_bgr)
     h_base, w_base = base.shape[:2]
-    h_d, w_d = design_bgr.shape[:2]
-    src = np.array([[0, 0], [w_d, 0], [w_d, h_d], [0, h_d]], dtype=np.float32)
 
     result = base.astype(np.float32)
     for dst in faces:
+        face_bgr, face_alpha = fit_design(design_bgr, design_alpha, face_aspect(dst), fit, bg)
+        h_d, w_d = face_bgr.shape[:2]
+        src = np.array([[0, 0], [w_d, 0], [w_d, h_d], [0, h_d]], dtype=np.float32)
         H = cv2.getPerspectiveTransform(src, dst)
-        warped = cv2.warpPerspective(design_bgr, H, (w_base, h_base), flags=cv2.INTER_LINEAR)
-        alpha = cv2.warpPerspective(design_alpha, H, (w_base, h_base), flags=cv2.INTER_LINEAR)
+        warped = cv2.warpPerspective(face_bgr, H, (w_base, h_base), flags=cv2.INTER_LINEAR)
+        alpha = cv2.warpPerspective(face_alpha, H, (w_base, h_base), flags=cv2.INTER_LINEAR)
         a = (alpha.astype(np.float32) / 255.0)[:, :, None]
         result = warped.astype(np.float32) * a + result * (1.0 - a)
     return np.clip(result, 0, 255).astype(np.uint8)
@@ -113,18 +181,24 @@ def composite_faces(base: np.ndarray, design: np.ndarray, faces: list[np.ndarray
 async def composite(
     base_photo_url: str = Form(...),
     design: UploadFile = File(...),
-    faces: str | None = Form(None),    # new: JSON list of faces (multi-billboard)
-    corners: str | None = Form(None),  # old: single face, still supported
+    faces: str | None = Form(None),       # new: JSON list of faces (multi-billboard)
+    corners: str | None = Form(None),     # old: single face, still supported
+    fit: str | None = Form(None),         # stretch (default) | cover | contain
+    background: str | None = Form(None),  # #RRGGBB for "contain"; default = design's edge colour
 ):
     try:
         quads = parse_faces(faces, corners)
+        fit_mode = normalise_fit(fit)
     except (ValueError, KeyError, json.JSONDecodeError) as e:
-        raise HTTPException(status_code=400, detail=f"bad corners: {e}")
+        raise HTTPException(status_code=400, detail=f"bad input: {e}")
 
     base = load_image_from_url(base_photo_url)
     design_img = load_image_from_bytes(await design.read(), keep_alpha=True)
 
-    result = composite_faces(base, design_img, quads)
+    try:
+        result = composite_faces(base, design_img, quads, fit_mode, background)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"bad input: {e}")
 
     ok, buf = cv2.imencode(".png", result)
     if not ok:
